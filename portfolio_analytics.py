@@ -164,22 +164,6 @@ with st.sidebar:
     bm_group = st.selectbox("Categoría benchmark", list(BENCHMARK_CATALOGUE.keys()))
     bm_name = st.selectbox("Benchmark", list(BENCHMARK_CATALOGUE[bm_group].keys()))
     bm_ticker = st.text_input("Benchmark custom", "").strip().upper() or BENCHMARK_CATALOGUE[bm_group][bm_name]
-    base_currency = st.selectbox("Divisa base cartera", ["EUR", "USD", "GBP", "CHF", "JPY"], index=0)
-
-    st.download_button(
-        "⬇ Descargar CSV de ejemplo",
-        EXAMPLE_CSV.encode("utf-8"),
-        file_name="portfolio_template.csv",
-        mime="text/csv",
-        width="stretch",
-    )
-    uploaded = st.file_uploader("Sube CSV de cartera", type=["csv"])
-
-    st.caption("Soporta CASH (+/-) y ORDER (BUY/SELL) por TICKER o ISIN. Para divisas, usa fx_to_base.")
-
-    bm_group = st.selectbox("Categoría benchmark", list(BENCHMARK_CATALOGUE.keys()))
-    bm_name = st.selectbox("Benchmark", list(BENCHMARK_CATALOGUE[bm_group].keys()))
-    bm_ticker = st.text_input("Custom benchmark", "").strip().upper() or BENCHMARK_CATALOGUE[bm_group][bm_name]
 
     start_date = st.date_input("Start", date(2020, 1, 1))
     end_date = st.date_input("End", date.today())
@@ -192,7 +176,6 @@ with st.sidebar:
 st.markdown(
     f'<div class="bbg-topbar"><span>PORT | PORTFOLIO ANALYTICS TERMINAL</span>'
     f'<span>{datetime.now().strftime("%d %b %Y %H:%M")} | BASE {base_currency} | BM {bm_ticker}</span></div>',
-    f'<span>{datetime.now().strftime("%d %b %Y %H:%M")} | BASE: {base_currency} | BM: {bm_ticker}</span></div>',
     unsafe_allow_html=True,
 )
 
@@ -201,11 +184,6 @@ if not run:
     st.stop()
 if uploaded is None:
     st.error("Debes subir un CSV.")
-    st.info("1) Descarga ejemplo CSV 2) súbelo con tus operaciones/caja 3) pulsa RUN ANALYSIS.")
-    st.stop()
-
-if uploaded is None:
-    st.error("Debes subir un CSV de cartera.")
     st.stop()
 
 raw = pd.read_csv(StringIO(uploaded.getvalue().decode("utf-8")))
@@ -218,7 +196,6 @@ if errs:
 order_tickers = sorted(tx.loc[tx["event_type"] == "ORDER", "ticker"].unique())
 if not order_tickers:
     st.error("No hay ORDER válidas.")
-    st.error("No hay ORDER válidas en el CSV.")
     st.stop()
 
 all_tickers = tuple(sorted(set(order_tickers + [bm_ticker])))
@@ -227,9 +204,10 @@ if prices.empty:
     st.error("No se pudieron descargar precios.")
     st.stop()
 
-missing = [t for t in order_tickers if t not in prices.columns]
+missing = sorted([t for t in order_tickers if t not in prices.columns])
 if missing:
-    st.warning(f"Sin datos para: {', '.join(missing)}")
+    missing_msg = ", ".join(missing)
+    st.warning(f"Sin datos para: {missing_msg}")
     tx = tx[~tx["ticker"].isin(missing)]
     order_tickers = sorted(tx.loc[tx["event_type"] == "ORDER", "ticker"].unique())
 if not order_tickers:
@@ -249,24 +227,6 @@ asset_rets = {tk: prices[tk].pct_change().dropna() for tk in order_tickers if tk
 returns_df = pd.DataFrame(asset_rets).dropna()
 
 twr_total = time_weighted_return(val_df[f"total_value_{base_currency}"], val_df["external_flow"])
-    st.warning(f"Sin precios para: {', '.join(missing)}")
-    tx = tx[~tx["ticker"].isin(missing)]
-
-if tx[tx["event_type"] == "ORDER"].empty:
-    st.error("No quedan órdenes con ticker descargable.")
-    st.stop()
-
-val_df, all_flows = build_holdings_and_value(prices, tx, base_currency)
-pr = val_df["portfolio_return"].dropna()
-bm_rets = prices[bm_ticker].pct_change().dropna() if bm_ticker in prices.columns else None
-if bm_rets is not None:
-    ix = pr.index.intersection(bm_rets.index)
-    pr, br = pr.loc[ix], bm_rets.loc[ix]
-else:
-    br = None
-
-external_flow = val_df["external_flow"]
-twr_total = time_weighted_return(val_df[f"total_value_{base_currency}"], external_flow)
 cf_dates = [d.date() for d in tx[tx["event_type"] == "CASH"]["date"].tolist()]
 cf_amts = [-float(a) for a in tx[tx["event_type"] == "CASH"]["cash_flow_base"].tolist()]
 mwr_total = money_weighted_return(cf_dates, cf_amts, val_df.index[-1].date(), float(val_df[f"total_value_{base_currency}"].iloc[-1]))
@@ -282,9 +242,6 @@ P = {
     "cvar": cvar_hist(pr, var_conf_f),
     "skew": float(stats.skew(pr.dropna())) if len(pr.dropna()) else np.nan,
     "kurt": float(stats.kurtosis(pr.dropna())) if len(pr.dropna()) else np.nan,
-    "mdd": max_drawdown(pr),
-    "var": var_hist(pr, var_conf_f),
-    "cvar": cvar_hist(pr, var_conf_f),
     "twr": twr_total,
     "mwr": mwr_total,
     "cum": (1 + pr).cumprod(),
@@ -292,13 +249,6 @@ P = {
 
 if br is not None:
     B = {"ann_ret": ann_return(br), "ann_vol": ann_vol(br), "sharpe": sharpe(br, rf_rate), "mdd": max_drawdown(br), "cum": (1 + br).cumprod()}
-    B = {
-        "ann_ret": ann_return(br),
-        "ann_vol": ann_vol(br),
-        "sharpe": sharpe(br, rf_rate),
-        "mdd": max_drawdown(br),
-        "cum": (1 + br).cumprod(),
-    }
     P["beta"], P["alpha"] = beta_alpha(pr, br, rf_rate)
     P["te"], P["ir"] = tracking_error(pr, br), info_ratio(pr, br)
 else:
@@ -306,7 +256,6 @@ else:
     P["beta"] = P["alpha"] = P["te"] = P["ir"] = np.nan
 
 tabs = st.tabs(["📈 OVERVIEW", "⚠️ RISK", "📊 ATTRIBUTION", "🔗 CORRELATION", "🎯 EFFICIENT FRONTIER", "📉 SCENARIOS", "🔄 ROLLING", "📋 OPERATIONS"])
-tabs = st.tabs(["📈 OVERVIEW", "⚠️ RISK", "🔄 ROLLING", "📋 OPERATIONS"])
 
 with tabs[0]:
     cols = st.columns(8)
@@ -322,19 +271,11 @@ with tabs[0]:
     ]
     for col, data in zip(cols, cards):
         col.markdown(mc(*data), unsafe_allow_html=True)
-        ("Max DD", fp(P["mdd"]), "", "neg"),
-        (f"VaR {var_conf}", fp(P["var"]), "", "neg"),
-        ("TWR", fp(P["twr"]), "Time weighted", "pos" if (P["twr"] or 0) > 0 else "neg"),
-        ("MWR/XIRR", fp(P["mwr"]), "Money weighted", "pos" if (P["mwr"] or 0) > 0 else "neg"),
-    ]
-    for c, item in zip(cols, cards):
-        c.markdown(mc(*item), unsafe_allow_html=True)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=P["cum"].index, y=P["cum"].values, name="Portfolio", line=dict(color=ORANGE, width=2.4)))
     if B:
         fig.add_trace(go.Scatter(x=B["cum"].index, y=B["cum"].values, name=bm_ticker, line=dict(color=BLUE, width=1.2, dash="dot")))
-        fig.add_trace(go.Scatter(x=B["cum"].index, y=B["cum"].values, name=bm_ticker, line=dict(color=BLUE, width=1.3, dash="dot")))
     fig.update_layout(**BBG_LAYOUT, title="Cumulative Return (Base=1)")
     st.plotly_chart(fig, width="stretch")
 
@@ -343,7 +284,6 @@ with tabs[0]:
     fig2.add_trace(go.Scatter(x=val_df.index, y=val_df[f"cash_balance_{base_currency}"], name="Cash", line=dict(color=BLUE)))
     fig2.add_trace(go.Scatter(x=val_df.index, y=val_df[f"total_value_{base_currency}"], name="Total", line=dict(color=GREEN, width=2.3)))
     fig2.update_layout(**BBG_LAYOUT, title=f"Portfolio Value ({base_currency})")
-    fig2.update_layout(**BBG_LAYOUT, title=f"Portfolio Value in {base_currency}")
     st.plotly_chart(fig2, width="stretch")
 
 with tabs[1]:
@@ -442,10 +382,6 @@ with tabs[5]:
         st.dataframe(sdf.assign(Portfolio=sdf["Portfolio"].map(fp), Benchmark=sdf["Benchmark"].map(fp), Excess=sdf["Excess"].map(fp)).set_index("Scenario"), width="stretch")
 
 with tabs[6]:
-        fig.update_layout(**BBG_LAYOUT, title="Return Distribution", xaxis_title="Daily %")
-        st.plotly_chart(fig, width="stretch")
-
-with tabs[2]:
     c1, c2 = st.columns(2)
     with c1:
         rs = rolling_sharpe(pr, roll_days)
@@ -476,23 +412,3 @@ with tabs[7]:
     st.dataframe(open_pos, width="stretch")
     export = prices.copy().join(val_df, how="left")
     st.download_button("⬇ Descargar resultados CSV", export.to_csv().encode("utf-8"), f"portfolio_results_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv", width="stretch")
-        fig.add_trace(go.Scatter(x=rc.index, y=rc.values, line=dict(color=ORANGE, width=2), name="Rolling corr"))
-        fig.add_hline(y=0, line_color="#333", line_dash="dot")
-        # Evita conflicto de kwargs con BBG_LAYOUT (yaxis ya existe)
-        layout = {**BBG_LAYOUT}
-        layout["yaxis"] = {**layout.get("yaxis", {}), "range": [-1.1, 1.1]}
-        fig.update_layout(**layout, title=f"Rolling {roll_days}d Correlation vs {bm_ticker}")
-        st.plotly_chart(fig, width="stretch")
-
-with tabs[3]:
-    st.markdown("#### Operaciones parseadas")
-    st.dataframe(tx, width="stretch")
-    export = prices.copy()
-    export = export.join(val_df, how="left")
-    st.download_button(
-        "⬇ Descargar resultados CSV",
-        export.to_csv().encode("utf-8"),
-        file_name=f"portfolio_results_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-        width="stretch",
-    )
