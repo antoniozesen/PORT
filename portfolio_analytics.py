@@ -171,7 +171,12 @@ with st.sidebar:
     var_conf = st.selectbox("VaR", ["95%", "99%", "90%"], index=0)
     var_conf_f = float(var_conf.replace("%", "")) / 100
     roll_days = int(st.selectbox("Rolling window", [21, 63, 126, 252], index=1))
-    run = st.button("⚡ RUN ANALYSIS", width="stretch")
+    run_clicked = st.button("⚡ RUN ANALYSIS", width="stretch")
+
+if "has_run" not in st.session_state:
+    st.session_state["has_run"] = False
+if run_clicked:
+    st.session_state["has_run"] = True
 
 st.markdown(
     f'<div class="bbg-topbar"><span>PORT | PORTFOLIO ANALYTICS TERMINAL</span>'
@@ -179,7 +184,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if not run:
+if not st.session_state["has_run"]:
     st.info("Sube tu CSV y pulsa RUN ANALYSIS.")
     st.stop()
 if uploaded is None:
@@ -215,6 +220,19 @@ if not order_tickers:
     st.stop()
 
 val_df, value_by_asset = build_holdings_and_values(prices, tx, base_currency)
+portfolio_start_date = tx["date"].min().date()
+display_start_date = st.sidebar.date_input(
+    "Mostrar gráficas y métricas desde",
+    value=portfolio_start_date,
+    min_value=portfolio_start_date,
+    max_value=end_date,
+)
+analysis_start_ts = pd.Timestamp(display_start_date)
+
+val_df = val_df[val_df.index >= analysis_start_ts]
+value_by_asset = value_by_asset[value_by_asset.index >= analysis_start_ts]
+prices = prices[prices.index >= analysis_start_ts]
+
 pr = val_df["portfolio_return"].dropna()
 bm_rets = prices[bm_ticker].pct_change().dropna() if bm_ticker in prices.columns else None
 if bm_rets is not None:
@@ -358,6 +376,29 @@ with tabs[4]:
         fig.add_trace(go.Scatter(x=[mv_v * 100], y=[mv_r * 100], mode="markers", marker=dict(size=12, color=BLUE), name="Min Vol"))
         fig.update_layout(**BBG_LAYOUT, title="Efficient Frontier", xaxis_title="Vol %", yaxis_title="Ret %")
         st.plotly_chart(fig, width="stretch")
+
+        eq = np.ones(len(ef["tickers"])) / len(ef["tickers"])
+        eq_r = eq @ ef["mu"].values
+        eq_v = np.sqrt(eq @ ef["cov"].values @ eq)
+
+        corner_summary = pd.DataFrame(
+            [
+                {"Portfolio": "Max Sharpe", "Ann Return": fp(ms_r), "Ann Vol": fp(ms_v), "Sharpe": fn((ms_r - rf_rate) / ms_v if ms_v > 0 else np.nan)},
+                {"Portfolio": "Min Vol", "Ann Return": fp(mv_r), "Ann Vol": fp(mv_v), "Sharpe": fn((mv_r - rf_rate) / mv_v if mv_v > 0 else np.nan)},
+                {"Portfolio": "Equal Weight", "Ann Return": fp(eq_r), "Ann Vol": fp(eq_v), "Sharpe": fn((eq_r - rf_rate) / eq_v if eq_v > 0 else np.nan)},
+            ]
+        )
+        st.markdown("#### Corner portfolios analizados")
+        st.dataframe(corner_summary, width="stretch")
+
+        weights_df = pd.DataFrame({
+            "Ticker": ef["tickers"],
+            "Max Sharpe": ef["max_sr_w"],
+            "Min Vol": ef["min_vol_w"],
+            "Equal Weight": eq,
+        }).set_index("Ticker")
+        st.markdown("#### % sugerido por corner portfolio")
+        st.dataframe(weights_df.applymap(lambda x: f"{x*100:.2f}%"), width="stretch")
 
 with tabs[5]:
     scen_sel = st.multiselect("Escenarios", list(HISTORICAL_SCENARIOS.keys()), default=["COVID Crash (Feb–Mar 2020)", "2022 Global Bear Market"])
