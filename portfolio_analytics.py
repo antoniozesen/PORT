@@ -41,7 +41,7 @@ from port_app.constants import (
     PURPLE,
     RED,
 )
-from port_app.data import fetch_prices
+from port_app.data import fetch_asset_profiles, fetch_prices
 from port_app.ui import fn, fp, mc
 
 st.set_page_config(page_title="PORT | Portfolio Analytics", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
@@ -63,6 +63,51 @@ ISIN_TO_TICKER = {
     "US88160R1014": "TSLA",
     "IE00B5BMR087": "IWDA.AS",
 }
+
+def build_dynamic_factor_labels(returns_df: pd.DataFrame, benchmark_returns: pd.Series | None, profiles: pd.DataFrame) -> pd.DataFrame:
+    if returns_df.empty:
+        return pd.DataFrame(columns=["ticker", "factor"])
+
+    rows = []
+    for tk in returns_df.columns:
+        r = returns_df[tk].dropna()
+        if r.empty:
+            rows.append({"ticker": tk, "factor": "Other"})
+            continue
+
+        mom_6m = (1 + r.tail(126)).prod() - 1 if len(r) >= 21 else np.nan
+        vol = r.std() * np.sqrt(252)
+        beta = np.nan
+        if benchmark_returns is not None:
+            aligned = pd.concat([r, benchmark_returns], axis=1).dropna()
+            if len(aligned) >= 20 and aligned.iloc[:, 1].std() > 0:
+                beta = aligned.iloc[:, 0].cov(aligned.iloc[:, 1]) / aligned.iloc[:, 1].var()
+
+        quote_type = ""
+        market_cap = np.nan
+        p = profiles[profiles["ticker"] == tk]
+        if not p.empty:
+            quote_type = str(p.iloc[0].get("quote_type", ""))
+            market_cap = p.iloc[0].get("market_cap", np.nan)
+
+        if "ETF" in quote_type or "FUND" in quote_type:
+            factor = "ETF/Fund Beta"
+        elif pd.notna(beta) and beta > 1.2:
+            factor = "High Beta"
+        elif pd.notna(beta) and beta < 0.8:
+            factor = "Low Beta/Defensive"
+        elif pd.notna(mom_6m) and mom_6m > 0.15:
+            factor = "Momentum"
+        elif pd.notna(vol) and vol < 0.20:
+            factor = "Low Volatility"
+        elif pd.notna(market_cap) and market_cap < 5e9:
+            factor = "Size (Small/Mid)"
+        else:
+            factor = "Core/Blend"
+
+        rows.append({"ticker": tk, "factor": factor})
+
+    return pd.DataFrame(rows)
 
 
 def calmar_ratio(r: pd.Series) -> float:
@@ -205,6 +250,7 @@ if not order_tickers:
 
 all_tickers = tuple(sorted(set(order_tickers + [bm_ticker])))
 prices = fetch_prices(all_tickers, str(start_date), str(end_date))
+profiles = fetch_asset_profiles(tuple(order_tickers))
 if prices.empty:
     st.error("No se pudieron descargar precios.")
     st.stop()
@@ -348,6 +394,26 @@ with tabs[2]:
             fig.update_layout(**BBG_LAYOUT, title="Return Contribution", xaxis_tickformat=".1%")
             st.plotly_chart(fig, width="stretch")
 
+    if not weights.empty:
+        expos = pd.DataFrame({"ticker": weights.index, "weight": weights.values})
+        expos = expos.merge(profiles[["ticker", "sector"]], on="ticker", how="left")
+        factor_df = build_dynamic_factor_labels(returns_df, br if br is not None else None, profiles)
+        expos = expos.merge(factor_df, on="ticker", how="left")
+        expos["sector"] = expos["sector"].fillna("Other")
+        expos["factor"] = expos["factor"].fillna("Other")
+        expos["w_pct"] = expos["weight"] / expos["weight"].sum()
+        s1, s2 = st.columns(2)
+        with s1:
+            sec = expos.groupby("sector", as_index=False)["w_pct"].sum().sort_values("w_pct")
+            fig = go.Figure(go.Bar(x=sec["w_pct"], y=sec["sector"], orientation="h", marker_color=BLUE, text=[f"{x*100:.1f}%" for x in sec["w_pct"]], textposition="outside"))
+            fig.update_layout(**BBG_LAYOUT, title="Sector Exposure", xaxis_tickformat=".1%")
+            st.plotly_chart(fig, width="stretch")
+        with s2:
+            fac = expos.groupby("factor", as_index=False)["w_pct"].sum().sort_values("w_pct")
+            fig = go.Figure(go.Bar(x=fac["w_pct"], y=fac["factor"], orientation="h", marker_color=PURPLE, text=[f"{x*100:.1f}%" for x in fac["w_pct"]], textposition="outside"))
+            fig.update_layout(**BBG_LAYOUT, title="Factor Exposure", xaxis_tickformat=".1%")
+            st.plotly_chart(fig, width="stretch")
+
 with tabs[3]:
     if len(returns_df.columns) < 2:
         st.info("No hay suficientes activos para correlación.")
@@ -400,27 +466,59 @@ with tabs[4]:
         st.markdown("#### % sugerido por corner portfolio")
         st.dataframe(weights_df.applymap(lambda x: f"{x*100:.2f}%"), width="stretch")
 
+        selected_corner = st.selectbox("Portfolio corner objetivo", ["Max Sharpe", "Min Vol", "Equal Weight"], index=0)
+        total_assets_now = float(val_df["asset_value"].iloc[-1]) if len(val_df) else 0.0
+        corner_col = {"Max Sharpe": "Max Sharpe", "Min Vol": "Min Vol", "Equal Weight": "Equal Weight"}[selected_corner]
+        alloc_df = weights_df[[corner_col]].rename(columns={corner_col: "target_weight"}).copy()
+        alloc_df["target_value"] = alloc_df["target_weight"] * total_assets_now
+        current_w = (weights / max(weights.sum(), 1e-9)).reindex(alloc_df.index).fillna(0.0)
+        alloc_df["current_weight"] = current_w
+        alloc_df["trade_weight"] = alloc_df["target_weight"] - alloc_df["current_weight"]
+        alloc_show = alloc_df.copy()
+        for c in ["target_weight", "current_weight", "trade_weight"]:
+            alloc_show[c] = alloc_show[c].map(lambda x: f"{x*100:.2f}%")
+        alloc_show["target_value"] = alloc_show["target_value"].map(lambda x: f"{x:,.0f} {base_currency}")
+        st.markdown(f"#### Asignación sugerida para {selected_corner}")
+        st.dataframe(alloc_show, width="stretch")
+
 with tabs[5]:
+    st.caption("Selecciona escenarios y pulsa el botón para calcular el impacto sobre la asignación actual.")
     scen_sel = st.multiselect("Escenarios", list(HISTORICAL_SCENARIOS.keys()), default=["COVID Crash (Feb–Mar 2020)", "2022 Global Bear Market"])
-    rows = []
-    for scen in scen_sel:
-        if scen == "Custom Period":
-            continue
-        s, e = HISTORICAL_SCENARIOS[scen]
-        sp = fetch_prices(tuple(sorted(set(order_tickers + [bm_ticker]))), s, e)
-        if sp.empty:
-            continue
-        tx_s = tx[tx["date"].between(pd.Timestamp(s), pd.Timestamp(e))]
-        if tx_s.empty:
-            continue
-        vdf, _ = build_holdings_and_values(sp, tx_s, base_currency)
-        sr = vdf["portfolio_return"].dropna()
-        pt = (1 + sr).prod() - 1 if not sr.empty else np.nan
-        bt = (1 + sp[bm_ticker].pct_change().dropna()).prod() - 1 if bm_ticker in sp.columns else np.nan
-        rows.append({"Scenario": scen, "Portfolio": pt, "Benchmark": bt, "Excess": pt - bt if pd.notna(bt) else np.nan})
-    if rows:
-        sdf = pd.DataFrame(rows)
-        st.dataframe(sdf.assign(Portfolio=sdf["Portfolio"].map(fp), Benchmark=sdf["Benchmark"].map(fp), Excess=sdf["Excess"].map(fp)).set_index("Scenario"), width="stretch")
+    run_scen = st.button("Calcular escenarios", width="stretch")
+    if run_scen:
+        rows = []
+        current_weights = (weights / max(weights.sum(), 1e-9)) if 'weights' in locals() and not weights.empty else pd.Series(dtype=float)
+        for scen in scen_sel:
+            if scen == "Custom Period":
+                continue
+            s, e = HISTORICAL_SCENARIOS[scen]
+            sp = fetch_prices(tuple(sorted(set(order_tickers + [bm_ticker]))), s, e)
+            if sp.empty:
+                continue
+            if current_weights.empty:
+                continue
+            scen_assets = current_weights.index.intersection(sp.columns)
+            if len(scen_assets) == 0:
+                continue
+            start_px = sp[scen_assets].ffill().bfill().iloc[0]
+            end_px = sp[scen_assets].ffill().bfill().iloc[-1]
+            ar = (end_px / start_px - 1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            w = current_weights.reindex(scen_assets).fillna(0.0)
+            pt = float((w * ar).sum())
+            bt = (1 + sp[bm_ticker].pct_change().dropna()).prod() - 1 if bm_ticker in sp.columns else np.nan
+            rows.append({"Scenario": scen, "Portfolio": pt, "Benchmark": bt, "Excess": pt - bt if pd.notna(bt) else np.nan})
+        if rows:
+            sdf = pd.DataFrame(rows)
+            st.dataframe(sdf.assign(Portfolio=sdf["Portfolio"].map(fp), Benchmark=sdf["Benchmark"].map(fp), Excess=sdf["Excess"].map(fp)).set_index("Scenario"), width="stretch")
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=sdf["Scenario"], y=sdf["Portfolio"], name="Portfolio", marker_color=[GREEN if v > 0 else RED for v in sdf["Portfolio"]]))
+            fig.add_trace(go.Bar(x=sdf["Scenario"], y=sdf["Benchmark"].fillna(0.0), name=bm_ticker, marker_color=BLUE, opacity=0.6))
+            fig.update_layout(**BBG_LAYOUT, title="Scenario Total Return", yaxis_tickformat=".1%", barmode="group")
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.warning("No se pudo calcular ningún escenario con los datos actuales.")
+    else:
+        st.info("Pulsa 'Calcular escenarios' para actualizar la tabla y gráfico.")
 
 with tabs[6]:
     c1, c2 = st.columns(2)
