@@ -45,3 +45,32 @@ def fetch_prices(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame
         except Exception:
             continue
     return px.dropna(how="all").sort_index()
+
+
+@st.cache_data(ttl=3600)
+def fetch_asset_profiles(tickers: tuple[str, ...]) -> pd.DataFrame:
+    symbols = sorted({t.strip().upper() for t in tickers if t and t.strip()})
+    rows = []
+    for sym in symbols:
+        sector = "Other"
+        industry = "Other"
+        market_cap = float("nan")
+        quote_type = ""
+        try:
+            info = yf.Ticker(sym).info or {}
+            sector = info.get("sector") or info.get("category") or "Other"
+            industry = info.get("industry") or info.get("fundFamily") or "Other"
+            market_cap = pd.to_numeric(info.get("marketCap", float("nan")), errors="coerce")
+            quote_type = str(info.get("quoteType", "")).upper()
+        except Exception:
+            pass
+        rows.append(
+            {
+                "ticker": sym,
+                "sector": sector,
+                "industry": industry,
+                "market_cap": market_cap,
+                "quote_type": quote_type,
+            }
+        )
+    return pd.DataFrame(rows)

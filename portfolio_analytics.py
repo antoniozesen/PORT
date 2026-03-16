@@ -41,7 +41,7 @@ from port_app.constants import (
     PURPLE,
     RED,
 )
-from port_app.data import fetch_prices
+from port_app.data import fetch_asset_profiles, fetch_prices
 from port_app.ui import fn, fp, mc
 
 st.set_page_config(page_title="PORT | Portfolio Analytics", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
@@ -64,33 +64,50 @@ ISIN_TO_TICKER = {
     "IE00B5BMR087": "IWDA.AS",
 }
 
-SECTOR_MAP = {
-    "AAPL": "Technology",
-    "MSFT": "Technology",
-    "GOOGL": "Communication Services",
-    "NVDA": "Technology",
-    "TSLA": "Consumer Discretionary",
-    "SPY": "Broad Market",
-    "QQQ": "Technology/Growth",
-    "IWM": "Small Cap",
-    "TLT": "Rates/Bonds",
-    "AGG": "Core Bonds",
-    "GLD": "Commodities",
-}
+def build_dynamic_factor_labels(returns_df: pd.DataFrame, benchmark_returns: pd.Series | None, profiles: pd.DataFrame) -> pd.DataFrame:
+    if returns_df.empty:
+        return pd.DataFrame(columns=["ticker", "factor"])
 
-FACTOR_MAP = {
-    "AAPL": "Quality/Growth",
-    "MSFT": "Quality/Growth",
-    "GOOGL": "Growth",
-    "NVDA": "Momentum/Growth",
-    "TSLA": "High Beta/Momentum",
-    "SPY": "Market Beta",
-    "QQQ": "Growth",
-    "IWM": "Size",
-    "TLT": "Duration",
-    "AGG": "Defensive",
-    "GLD": "Inflation Hedge",
-}
+    rows = []
+    for tk in returns_df.columns:
+        r = returns_df[tk].dropna()
+        if r.empty:
+            rows.append({"ticker": tk, "factor": "Other"})
+            continue
+
+        mom_6m = (1 + r.tail(126)).prod() - 1 if len(r) >= 21 else np.nan
+        vol = r.std() * np.sqrt(252)
+        beta = np.nan
+        if benchmark_returns is not None:
+            aligned = pd.concat([r, benchmark_returns], axis=1).dropna()
+            if len(aligned) >= 20 and aligned.iloc[:, 1].std() > 0:
+                beta = aligned.iloc[:, 0].cov(aligned.iloc[:, 1]) / aligned.iloc[:, 1].var()
+
+        quote_type = ""
+        market_cap = np.nan
+        p = profiles[profiles["ticker"] == tk]
+        if not p.empty:
+            quote_type = str(p.iloc[0].get("quote_type", ""))
+            market_cap = p.iloc[0].get("market_cap", np.nan)
+
+        if "ETF" in quote_type or "FUND" in quote_type:
+            factor = "ETF/Fund Beta"
+        elif pd.notna(beta) and beta > 1.2:
+            factor = "High Beta"
+        elif pd.notna(beta) and beta < 0.8:
+            factor = "Low Beta/Defensive"
+        elif pd.notna(mom_6m) and mom_6m > 0.15:
+            factor = "Momentum"
+        elif pd.notna(vol) and vol < 0.20:
+            factor = "Low Volatility"
+        elif pd.notna(market_cap) and market_cap < 5e9:
+            factor = "Size (Small/Mid)"
+        else:
+            factor = "Core/Blend"
+
+        rows.append({"ticker": tk, "factor": factor})
+
+    return pd.DataFrame(rows)
 
 
 def calmar_ratio(r: pd.Series) -> float:
@@ -233,6 +250,7 @@ if not order_tickers:
 
 all_tickers = tuple(sorted(set(order_tickers + [bm_ticker])))
 prices = fetch_prices(all_tickers, str(start_date), str(end_date))
+profiles = fetch_asset_profiles(tuple(order_tickers))
 if prices.empty:
     st.error("No se pudieron descargar precios.")
     st.stop()
@@ -378,8 +396,11 @@ with tabs[2]:
 
     if not weights.empty:
         expos = pd.DataFrame({"ticker": weights.index, "weight": weights.values})
-        expos["sector"] = expos["ticker"].map(SECTOR_MAP).fillna("Other")
-        expos["factor"] = expos["ticker"].map(FACTOR_MAP).fillna("Other")
+        expos = expos.merge(profiles[["ticker", "sector"]], on="ticker", how="left")
+        factor_df = build_dynamic_factor_labels(returns_df, br if br is not None else None, profiles)
+        expos = expos.merge(factor_df, on="ticker", how="left")
+        expos["sector"] = expos["sector"].fillna("Other")
+        expos["factor"] = expos["factor"].fillna("Other")
         expos["w_pct"] = expos["weight"] / expos["weight"].sum()
         s1, s2 = st.columns(2)
         with s1:
